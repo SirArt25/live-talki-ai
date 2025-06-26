@@ -16,25 +16,26 @@ import logging
 from dotenv import load_dotenv
 from datetime import datetime
 
-# Setup fresh log per run
+# Create a new log file each run
 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-log_filename = f"livelog_{timestamp}.log"
 logging.basicConfig(
-    filename=log_filename,
+    filename=f"livelog_{timestamp}.log",
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
-    filemode="w"
+    filemode="w",
 )
 
-# Load .env
+# Load environment variables
 load_dotenv()
 openai.api_key = os.getenv("OPENAI_API_KEY")
 
 SAMPLE_RATE = 16000
-CHUNK_DURATION = 2
+CHUNK_DURATION = 2  # seconds
 
 
 class AsyncAudioStream:
+    """Handles asynchronous microphone input as audio chunks."""
+
     def __init__(self, sample_rate=SAMPLE_RATE, chunk_duration=CHUNK_DURATION, device=None):
         self.sample_rate = sample_rate
         self.chunk_duration = chunk_duration
@@ -43,29 +44,34 @@ class AsyncAudioStream:
         self.stream = None
 
     def callback(self, indata, frames, time_info, status):
+        """Called by SoundDevice when a new chunk is ready."""
         self.queue.put(indata.copy())
         logging.info("🔔 Audio callback received")
 
-    def start(self):
-        logging.info("🔍 Starting mic input...")
+    def start(self, blocksize=None):
+        """Open the input stream; must be called from the GUI thread."""
+        logging.info("🔍 Attempting to start mic input...")
         if self.device is None:
             raise RuntimeError("❌ No mic device index provided.")
         self.stream = sd.InputStream(
             samplerate=self.sample_rate,
             channels=1,
             callback=self.callback,
-            device=self.device
+            device=self.device,
+            blocksize=blocksize,
         )
         self.stream.start()
         logging.info("🔊 Mic stream started.")
 
     def stop(self):
+        """Stop and close the input stream."""
         if self.stream:
             self.stream.stop()
             self.stream.close()
             logging.info("🛑 Mic stream stopped.")
 
     async def get_chunk(self):
+        """Wait for next chunk from the queue."""
         while True:
             if not self.queue.empty():
                 return self.queue.get().flatten()
@@ -73,9 +79,11 @@ class AsyncAudioStream:
 
 
 class SpeechRecognizer:
-    def __init__(self):
+    """Wraps the Whisper model for transcription."""
+
+    def __init__(self, model_name="base"):
         logging.info("📥 Loading Whisper model…")
-        self.model = whisper.load_model("base")
+        self.model = whisper.load_model(model_name)
         logging.info("✅ Whisper loaded.")
 
     async def transcribe(self, audio_data):
@@ -87,6 +95,8 @@ class SpeechRecognizer:
 
 
 class LanguageProcessor:
+    """Uses OpenAI GPT to generate responses from input text."""
+
     def __init__(self, model="gpt-3.5-turbo"):
         self.model = model
 
@@ -95,15 +105,17 @@ class LanguageProcessor:
             openai.ChatCompletion.create,
             model=self.model,
             messages=[{"role": "user", "content": text}],
-            max_tokens=100
+            max_tokens=100,
         )
         return response.choices[0].message.content
 
 
 class SpeechSynthesizer:
-    def __init__(self):
+    """Uses Coqui TTS to convert text to speech."""
+
+    def __init__(self, tts_model_name="tts_models/en/ljspeech/tacotron2-DDC"):
         logging.info("🔊 Loading Coqui TTS…")
-        self.tts = TTS(model_name="tts_models/en/ljspeech/tacotron2-DDC", progress_bar=False, gpu=False)
+        self.tts = TTS(model_name=tts_model_name, progress_bar=False, gpu=False)
         logging.info("✅ Coqui TTS loaded.")
 
     async def speak(self, text):
@@ -114,15 +126,17 @@ class SpeechSynthesizer:
 
 
 class LiveTalkAI:
-    def __init__(self, gui, device_index, recognizer, synthesizer):
-        self.audio_stream = AsyncAudioStream(device=device_index)
+    """Coordinates processing and output—assumes mic stream already started."""
+
+    def __init__(self, gui, audio_stream, recognizer, synthesizer):
+        self.audio_stream = audio_stream
         self.recognizer = recognizer
         self.processor = LanguageProcessor()
         self.synthesizer = synthesizer
         self.gui = gui
 
     async def run(self):
-        self.audio_stream.start()
+        self.gui.log("▶️ Processing loop started.")
         try:
             while True:
                 chunk = await self.audio_stream.get_chunk()
@@ -137,6 +151,8 @@ class LiveTalkAI:
 
 
 class LiveTalkAIGUI:
+    """Tkinter-based GUI for controlling and displaying the application."""
+
     def __init__(self, root):
         self.root = root
         self.root.title("LiveTalkAI")
@@ -153,6 +169,9 @@ class LiveTalkAIGUI:
         self.recognizer = SpeechRecognizer()
         self.synthesizer = SpeechSynthesizer()
         self.log("✅ Models loaded.")
+
+        # Prepare audio stream (device set later)
+        self.audio_stream = AsyncAudioStream()
 
         # Detect mics
         self.input_devices = [
@@ -171,32 +190,36 @@ class LiveTalkAIGUI:
 
         # Status label
         self.status_label = tk.Label(root, text=status)
-        self.status_label.pack()
+        self.status_label.pack(pady=(5, 10))
 
         # Buttons: Start / Stop / Test Mic
-        btns = tk.Frame(root)
-        btns.pack(pady=5)
+        btn_frame = tk.Frame(root)
+        btn_frame.pack(pady=5)
         self.start_button = tk.Button(
-            btns, text="Start", command=self.start,
-            state=tk.NORMAL if mic_names else tk.DISABLED
+            btn_frame,
+            text="Start",
+            command=self.start,
+            state=tk.NORMAL if mic_names else tk.DISABLED,
         )
         self.start_button.pack(side=tk.LEFT, padx=5)
         self.stop_button = tk.Button(
-            btns, text="Stop", command=self.stop, state=tk.DISABLED
+            btn_frame, text="Stop", command=self.stop, state=tk.DISABLED
         )
         self.stop_button.pack(side=tk.LEFT, padx=5)
         self.test_button = tk.Button(
-            btns, text="Test Mic", command=self.test_mic,
-            state=tk.NORMAL if mic_names else tk.DISABLED
+            btn_frame,
+            text="Test Mic",
+            command=self.test_mic,
+            state=tk.NORMAL if mic_names else tk.DISABLED,
         )
         self.test_button.pack(side=tk.LEFT, padx=5)
 
         # Async setup
         self.loop = asyncio.new_event_loop()
         self.task = None
-        self.app = None
 
     def log(self, msg):
+        """Log to file and show in GUI."""
         logging.info(msg)
         self.text_area.config(state=tk.NORMAL)
         self.text_area.insert(tk.END, msg + "\n")
@@ -204,21 +227,36 @@ class LiveTalkAIGUI:
         self.text_area.yview(tk.END)
 
     def start(self):
+        """Start mic stream then launch async transcription loop."""
         sel = self.device_var.get()
         idx = next((i for n, i in self.input_devices if n == sel), None)
         self.log(f"🎤 Mic selected: {sel}")
-        self.log("🟢 Listening started…")
 
-        self.app = LiveTalkAI(self, idx, self.recognizer, self.synthesizer)
-        self.task = self.loop.create_task(self.app.run())
+        # Start mic input immediately
+        try:
+            blocksize = int(self.audio_stream.sample_rate // 10)
+            self.audio_stream.device = idx
+            self.audio_stream.start(blocksize=blocksize)
+            self.log("🟢 Listening started…")
+        except Exception as e:
+            self.log(f"❌ Failed to open mic: {e}")
+            return
+
+        # Start async processing
+        self.task = self.loop.create_task(
+            LiveTalkAI(self, self.audio_stream, self.recognizer, self.synthesizer).run()
+        )
         self.start_button.config(state=tk.DISABLED)
         self.stop_button.config(state=tk.NORMAL)
 
     def stop(self):
+        """Stop transcription loop and mic stream."""
         if self.task:
             self.task.cancel()
+        self.audio_stream.stop()
         self.start_button.config(state=tk.NORMAL)
         self.stop_button.config(state=tk.DISABLED)
+        self.log("🛑 Stop requested.")
 
     def test_mic(self):
         """Record 3 seconds from the selected mic, save & play back."""
@@ -228,15 +266,16 @@ class LiveTalkAIGUI:
 
     def _test_thread(self, device_index):
         from scipy.io.wavfile import write
-        duration = 3  # seconds
+
+        duration = 3
         self.log(f"🎤 Testing mic for {duration}s on device #{device_index}...")
         try:
             audio = sd.rec(
                 int(duration * SAMPLE_RATE),
                 samplerate=SAMPLE_RATE,
                 channels=1,
-                dtype='int16',
-                device=device_index
+                dtype="int16",
+                device=device_index,
             )
             sd.wait()
             write("mic_test.wav", SAMPLE_RATE, audio)
@@ -247,52 +286,13 @@ class LiveTalkAIGUI:
             self.log(f"❌ Test failed: {e}")
 
 
-
-def test_recorder():
-    devs = sd.query_devices()
-    inputs = [i for i, d in enumerate(devs) if d["max_input_channels"] > 0]
-    if not inputs:
-        logging.error("❌ No mic devices found.")
-        return
-    device = inputs[0]
-    logging.info(f"🎧 test_recorder using device #{device} ({devs[device]['name']})")
-    stream = AsyncAudioStream(device=device)
-    stream.start()
-    time.sleep(3)
-    stream.stop()
-    logging.info("✅ test_recorder completed 3 seconds.")
-
-
-def test_microphone_recording(output_path="test_recording.wav", duration=3, sample_rate=SAMPLE_RATE):
-    """Record audio from the default mic and save to a WAV file."""
-    import numpy as np
-    mic_list = sd.query_devices()
-    inputs = [i for i, d in enumerate(mic_list) if d["max_input_channels"] > 0]
-    if not inputs:
-        logging.error("❌ No input-capable device found for test_microphone_recording.")
-        return
-    device = inputs[0]
-    logging.info(f"🔍 test_microphone_recording: using device #{device} ({mic_list[device]['name']})")
-    audio = sd.rec(int(duration * sample_rate), samplerate=sample_rate, channels=1, dtype='int16', device=device)
-    sd.wait()
-    wavfile.write(output_path, sample_rate, audio)
-    logging.info(f"💾 Saved recording to {output_path}")
-
-
 class LiveTalkAIEntryPoint:
+    """Initializes and starts the GUI and asyncio loop."""
+
     def __init__(self):
         self.gui = None
 
     def run(self):
-        if len(sys.argv) > 1:
-            arg = sys.argv[1]
-            if arg == "--test-recorder":
-                test_recorder()
-                return
-            elif arg == "--test-recording":
-                test_microphone_recording()
-                return
-
         root = tk.Tk()
         self.gui = LiveTalkAIGUI(root)
         threading.Thread(target=self._start_loop, daemon=True).start()
