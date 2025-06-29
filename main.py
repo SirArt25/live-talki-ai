@@ -7,7 +7,6 @@ from tkinter import scrolledtext, filedialog
 import whisper
 import openai
 import sounddevice as sd
-from TTS.api import TTS
 import queue
 import tempfile
 import scipy.io.wavfile as wavfile
@@ -103,11 +102,9 @@ class SpeechRecognizer:
             logging.info("✅ Using OpenAI Whisper API for transcription.")
 
     async def transcribe(self, audio_data):
-        # Write audio to temp file
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
             wavfile.write(f.name, SAMPLE_RATE, audio_data)
             file_path = f.name
-
         if self.use_openai:
             with open(file_path, "rb") as audio_file:
                 transcript = openai.Audio.transcribe("whisper-1", audio_file)
@@ -115,14 +112,13 @@ class SpeechRecognizer:
         else:
             result = self.model.transcribe(file_path)
             text = result.get("text", "").strip()
-
         os.remove(file_path)
         logging.info(f"📝 Transcribed text: '{text}'")
         return split_text_chunks(text) if text else []
 
 
 class LiveTalkAI:
-    """Coordinates processing—bot responses and TTS disabled."""
+    """Coordinates processing—bot and TTS disabled."""
 
     def __init__(self, gui, audio_stream, recognizer):
         self.audio_stream = audio_stream
@@ -136,9 +132,8 @@ class LiveTalkAI:
                 chunk = await self.audio_stream.get_chunk()
                 text_chunks = await self.recognizer.transcribe(chunk)
                 for idx, text in enumerate(text_chunks, 1):
-                    if not text.strip():
-                        continue
-                    self.gui.log(f"You (chunk {idx}/{len(text_chunks)}): {text}", tag="user")
+                    if text.strip():
+                        self.gui.log(f"You (chunk {idx}/{len(text_chunks)}): {text}", tag="user")
         except asyncio.CancelledError:
             self.audio_stream.stop()
             self.gui.log("🛑 Listening stopped.")
@@ -151,78 +146,62 @@ class LiveTalkAIGUI:
         self.root = root
         self.root.title("LiveTalkAI")
 
-        # Text display area
-        self.text_area = scrolledtext.ScrolledText(
-            root, wrap=tk.WORD, width=60, height=20, font=("Arial", 12)
-        )
+        # Text display
+        self.text_area = scrolledtext.ScrolledText(root, wrap=tk.WORD, width=60, height=20, font=("Arial", 12))
         self.text_area.pack(padx=10, pady=10)
         self.text_area.config(state=tk.DISABLED)
         self.text_area.tag_config("user", foreground="blue")
 
-        # Controls frame
-        control_frame = tk.Frame(root)
-        control_frame.pack(pady=5)
-
-        # Whisper model selection
-        tk.Label(control_frame, text="Whisper Model:").grid(row=0, column=0)
-        whisper_models = ["tiny", "base", "small", "medium", "large"]
+        # Controls
+        control = tk.Frame(root)
+        control.pack(pady=5)
+        tk.Label(control, text="Whisper Model:").grid(row=0, column=0)
+        models = ["tiny", "base", "small", "medium", "large"]
         self.whisper_var = tk.StringVar(value="base")
-        tk.OptionMenu(control_frame, self.whisper_var, *whisper_models).grid(row=0, column=1)
-
-        # OpenAI Whisper toggle
-        tk.Label(control_frame, text="Use OpenAI Whisper:").grid(row=0, column=2)
+        tk.OptionMenu(control, self.whisper_var, *models).grid(row=0, column=1)
+        tk.Label(control, text="Use OpenAI:").grid(row=0, column=2)
         self.openai_var = tk.BooleanVar(value=False)
-        tk.Checkbutton(control_frame, variable=self.openai_var).grid(row=0, column=3)
+        tk.Checkbutton(control, variable=self.openai_var).grid(row=0, column=3)
+        tk.Label(control, text="TTS Model:").grid(row=1, column=0)
+        tts = ["tts_models/en/ljspeech/tacotron2-DDC", "tts_models/en/ljspeech/glow-tts"]
+        self.tts_var = tk.StringVar(value=tts[0])
+        tk.OptionMenu(control, self.tts_var, *tts).grid(row=1, column=1)
 
-        # TTS model selection
-        tk.Label(control_frame, text="TTS Model:").grid(row=1, column=0)
-        tts_models = ["tts_models/en/ljspeech/tacotron2-DDC", "tts_models/en/ljspeech/glow-tts"]
-        self.tts_var = tk.StringVar(value=tts_models[0])
-        tk.OptionMenu(control_frame, self.tts_var, *tts_models).grid(row=1, column=1)
-
-        # Buttons frame
-        btn_frame = tk.Frame(root)
-        btn_frame.pack(pady=5)
-        self.start_button = tk.Button(btn_frame, text="Start", command=self.start)
+        # Buttons
+        btns = tk.Frame(root)
+        btns.pack(pady=5)
+        self.start_button = tk.Button(btns, text="Start", command=self.start)
         self.start_button.pack(side=tk.LEFT, padx=5)
-        self.stop_button = tk.Button(btn_frame, text="Stop", command=self.stop, state=tk.DISABLED)
+        self.stop_button = tk.Button(btns, text="Stop", command=self.stop, state=tk.DISABLED)
         self.stop_button.pack(side=tk.LEFT, padx=5)
-        self.test_button = tk.Button(btn_frame, text="Test Mic", command=self.test_mic)
+        self.test_button = tk.Button(btns, text="Test Mic", command=self.test_mic)
         self.test_button.pack(side=tk.LEFT, padx=5)
-        self.clear_button = tk.Button(btn_frame, text="Clear", command=self.clear)
+        self.clear_button = tk.Button(btns, text="Clear", command=self.clear)
         self.clear_button.pack(side=tk.LEFT, padx=5)
-        self.save_button = tk.Button(btn_frame, text="Save", command=self.save)
+        self.save_button = tk.Button(btns, text="Save", command=self.save)
         self.save_button.pack(side=tk.LEFT, padx=5)
 
-        # Status label
+        # Status
         self.status_label = tk.Label(root, text="Ready")
-        self.status_label.pack(pady=(5, 10))
+        self.status_label.pack(pady=(5,10))
 
-        # Audio stream and device list
+        # Audio devices
         self.audio_stream = AsyncAudioStream()
-        self.input_devices = [
-            (dev['name'], idx) for idx, dev in enumerate(sd.query_devices()) if dev['max_input_channels'] > 0
-        ]
-        mic_names = [name for name, _ in self.input_devices]
-        status = f"✅ {len(mic_names)} mic(s) found" if mic_names else "❌ No mics found"
-        self.log(status)
-
-        # Mic selection dropdown
+        devices = [(d['name'], i) for i, d in enumerate(sd.query_devices()) if d['max_input_channels']>0]
+        mics = [n for n,_ in devices]
+        self.device_var = tk.StringVar(value=mics[0] if mics else "")
         tk.Label(root, text="Select Mic:").pack()
-        self.device_var = tk.StringVar(value=mic_names[0] if mic_names else "")
-        tk.OptionMenu(root, self.device_var, *(mic_names or [""])).pack()
+        tk.OptionMenu(root, self.device_var, *mics).pack()
+        self.log(f"✅ {len(mics)} mic(s) found")
 
-        # Event loop
-        self.loop = asyncio.new_event_loop()
-        self.task = None
+        self.loop = None  # will store background loop
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
     def log(self, msg, tag=None):
         logging.info(msg)
         self.text_area.config(state=tk.NORMAL)
-        if tag:
-            self.text_area.insert(tk.END, msg + "\n", tag)
-        else:
-            self.text_area.insert(tk.END, msg + "\n")
+        if tag: self.text_area.insert(tk.END, msg+"\n", tag)
+        else:    self.text_area.insert(tk.END, msg+"\n")
         self.text_area.config(state=tk.DISABLED)
         self.text_area.yview(tk.END)
 
@@ -232,49 +211,46 @@ class LiveTalkAIGUI:
         threading.Thread(target=self._load_and_start, daemon=True).start()
 
     def _load_and_start(self):
+        # Create and set new asyncio loop in this thread
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        self.loop = loop
         self.log("⏳ Reloading models…")
-        self.recognizer = SpeechRecognizer(
-            model_name=self.whisper_var.get(), use_openai_whisper=self.openai_var.get()
-        )
+        self.recognizer = SpeechRecognizer(self.whisper_var.get(), self.openai_var.get())
         self.log("✅ Models loaded.")
 
         sel = self.device_var.get()
-        idx = next((i for n, i in self.input_devices if n == sel), None)
-        self.log(f"🎤 Mic selected: {sel}")
+        idx = next((i for n,i in enumerate(sd.query_devices()) if n==sel), None)
         self.audio_stream.device = idx
         self.audio_stream.start()
+        self.log(f"🎤 Mic selected: {sel}")
         self.log("🟢 Listening started…")
-        self.task = self.loop.create_task(
-            LiveTalkAI(self, self.audio_stream, self.recognizer).run()
-        )
-        asyncio.set_event_loop(self.loop)
-        self.loop.run_forever()
+
+        # Schedule the transcription task
+        loop.create_task(LiveTalkAI(self, self.audio_stream, self.recognizer).run())
+        loop.run_forever()
 
     def stop(self):
-        if self.task:
-            self.task.cancel()
+        # Stop the audio stream
         self.audio_stream.stop()
+        # Stop the asyncio loop
+        if self.loop:
+            self.loop.call_soon_threadsafe(self.loop.stop)
         self.start_button.config(state=tk.NORMAL)
         self.stop_button.config(state=tk.DISABLED)
         self.log("🛑 Stop requested.")
 
     def test_mic(self):
         sel = self.device_var.get()
-        idx = next((i for n, i in self.input_devices if n == sel), None)
+        idx = next((i for n,i in enumerate(sd.query_devices()) if n==sel), None)
         threading.Thread(target=self._test_thread, args=(idx,), daemon=True).start()
 
     def _test_thread(self, device_index):
         from scipy.io.wavfile import write
-        duration = 3
+        duration=3
         self.log(f"🎤 Testing mic for {duration}s on device #{device_index}...")
         try:
-            audio = sd.rec(
-                int(duration * SAMPLE_RATE),
-                samplerate=SAMPLE_RATE,
-                channels=1,
-                dtype="int16",
-                device=device_index,
-            )
+            audio = sd.rec(int(duration*SAMPLE_RATE), samplerate=SAMPLE_RATE, channels=1, dtype="int16", device=device_index)
             sd.wait()
             write("mic_test.wav", SAMPLE_RATE, audio)
             self.log("💾 mic_test.wav saved.")
@@ -291,31 +267,30 @@ class LiveTalkAIGUI:
 
     def save(self):
         try:
-            filepath = filedialog.asksaveasfilename(
-                defaultextension=".txt",
-                filetypes=[("Text Files", "*.txt"), ("All Files", "*.*")],
-            )
+            fp = filedialog.asksaveasfilename(defaultextension=".txt",
+                filetypes=[("Text Files","*.txt"),("All Files","*.*")])
         except tk.TclError:
-            self.log("❌ Save dialog failed: UI already closed.")
+            self.log("❌ Save dialog failed.")
             return
-        if not filepath:
-            return
+        if not fp: return
         try:
-            with open(filepath, "w", encoding="utf-8") as f:
+            with open(fp, "w", encoding="utf-8") as f:
                 f.write(self.text_area.get("1.0", tk.END))
-            self.log(f"💾 Chat saved to {filepath}")
+            self.log(f"💾 Chat saved to {fp}")
         except Exception as e:
             self.log(f"❌ Save failed: {e}")
 
+    def on_close(self):
+        # Ensure background loop is stopped
+        if self.loop and self.loop.is_running():
+            self.loop.call_soon_threadsafe(self.loop.stop)
+        self.root.destroy()
 
 class LiveTalkAIEntryPoint:
-    """Initializes and starts the GUI."""
-
     def run(self):
         root = tk.Tk()
-        gui = LiveTalkAIGUI(root)
+        LiveTalkAIGUI(root)
         root.mainloop()
-
 
 if __name__ == "__main__":
     LiveTalkAIEntryPoint().run()
