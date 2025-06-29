@@ -7,7 +7,6 @@ from tkinter import scrolledtext
 import whisper
 from openai import OpenAI
 import sounddevice as sd
-import queue
 import tempfile
 import scipy.io.wavfile as wavfile
 import os
@@ -16,6 +15,7 @@ from dotenv import load_dotenv
 from datetime import datetime
 import textwrap
 import numpy as np
+import subprocess
 from TTS.api import TTS
 
 # ——— Setup logging ———
@@ -36,10 +36,11 @@ SAMPLE_RATE = 16000
 CHUNK_DURATION = 2       # seconds; only used to size the buffer
 MAX_TEXT_CHUNK = 200     # chars per split
 
+
 def split_text_chunks(text, max_length=MAX_TEXT_CHUNK):
     return textwrap.wrap(text, max_length)
 
-# ——— Audio buffer that just records everything ———
+# ——— Audio buffer ———
 class AsyncAudioStream:
     def __init__(self, sample_rate=SAMPLE_RATE, device=None):
         self.sample_rate = sample_rate
@@ -88,17 +89,12 @@ class SpeechRecognizer:
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
             wavfile.write(f.name, SAMPLE_RATE, audio_data)
             path = f.name
-
         if self.use_openai:
-            resp = client.audio.transcriptions.create(
-                model="whisper-1",
-                file=open(path, "rb")
-            )
+            resp = client.audio.transcriptions.create(model="whisper-1", file=open(path, "rb"))
             text = resp.text.strip()
         else:
             result = self.model.transcribe(path)
             text = result.get("text", "").strip()
-
         os.remove(path)
         logging.info(f"📝 Transcribed text: '{text}'")
         return split_text_chunks(text) if text else []
@@ -111,11 +107,7 @@ class LanguageProcessor:
 
     def generate_reply(self, user_text):
         self.conversation.append({"role": "user", "content": user_text})
-        resp = client.chat.completions.create(
-            model=self.model,
-            messages=self.conversation,
-            max_tokens=150,
-        )
+        resp = client.chat.completions.create(model=self.model, messages=self.conversation, max_tokens=150)
         reply = resp.choices[0].message.content.strip()
         self.conversation.append({"role": "assistant", "content": reply})
         logging.info(f"💬 GPT reply: '{reply}'")
@@ -126,144 +118,131 @@ class SpeechSynthesizer:
     def __init__(self, tts_model):
         logging.info(f"🔊 Loading TTS model: {tts_model}")
         self.tts = TTS(model_name=tts_model, progress_bar=False, gpu=False)
+        self.processes = []
 
-    def speak(self, text):
+    def speak(self, text, audio_on=True):
+        if not audio_on:
+            return
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
             self.tts.tts_to_file(text=text, file_path=f.name)
-            os.system(f"aplay {f.name}")
-            time.sleep(0.1)
-            os.remove(f.name)
+            p = subprocess.Popen(["aplay", f.name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            self.processes.append((p, f.name))
+
+    def stop_all(self):
+        for p, path in self.processes:
+            try: p.terminate()
+            except: pass
+            try: os.remove(path)
+            except: pass
+        self.processes.clear()
 
 # ——— Main GUI ———
 class LiveTalkAIGUI:
     def __init__(self, root):
         self.root = root
         root.title("LiveTalkAI")
-
-        # chat display
-        self.text_area = scrolledtext.ScrolledText(root, wrap=tk.WORD,
-                                                   width=60, height=20,
-                                                   font=("Arial",12))
+        self.text_area = scrolledtext.ScrolledText(root, wrap=tk.WORD, width=60, height=20, font=("Arial",12))
         self.text_area.pack(padx=10, pady=10)
         self.text_area.config(state=tk.DISABLED)
         self.text_area.tag_config("user", foreground="blue")
         self.text_area.tag_config("bot", foreground="green")
-
-        # controls
         ctrl = tk.Frame(root); ctrl.pack(pady=5)
         tk.Label(ctrl, text="Whisper Model:").grid(row=0,column=0)
-        wm = ["tiny","base","small","medium","large"]
-        self.whisper_var = tk.StringVar(value="base")
-        tk.OptionMenu(ctrl, self.whisper_var, *wm).grid(row=0,column=1)
+        wm=["tiny","base","small","medium","large"]
+        self.whisper_var=tk.StringVar(value="base")
+        tk.OptionMenu(ctrl,self.whisper_var,*wm).grid(row=0,column=1)
+        tk.Label(ctrl,text="Use OpenAI:").grid(row=0,column=2)
+        self.openai_var=tk.BooleanVar(value=False)
+        tk.Checkbutton(ctrl,variable=self.openai_var).grid(row=0,column=3)
+        tk.Label(ctrl,text="TTS Model:").grid(row=1,column=0)
+        tm=["tts_models/en/ljspeech/tacotron2-DDC","tts_models/en/ljspeech/glow-tts"]
+        self.tts_var=tk.StringVar(value=tm[0])
+        tk.OptionMenu(ctrl,self.tts_var,*tm).grid(row=1,column=1)
+        tk.Label(ctrl,text="Audio On:").grid(row=1,column=2)
+        self.audio_var=tk.BooleanVar(value=True)
+        tk.Checkbutton(ctrl,variable=self.audio_var).grid(row=1,column=3)
+        btnf=tk.Frame(root); btnf.pack(pady=5)
+        self.start_btn=tk.Button(btnf,text="Start",command=self.start_live)
+        self.start_btn.pack(side=tk.LEFT,padx=5)
+        self.stop_btn=tk.Button(btnf,text="Stop",command=self.stop_live,state=tk.DISABLED)
+        self.stop_btn.pack(side=tk.LEFT,padx=5)
+        self.ask_entry=tk.Entry(btnf,width=40,state=tk.DISABLED)
+        self.ask_entry.pack(side=tk.LEFT,padx=5)
+        self.ask_btn=tk.Button(btnf,text="Ask",command=self.ask_question,state=tk.DISABLED)
+        self.ask_btn.pack(side=tk.LEFT,padx=5)
+        tk.Label(root,text="Select Mic:").pack()
+        devices=[d['name'] for d in sd.query_devices() if d['max_input_channels']>0]
+        self.dev_var=tk.StringVar(value=devices[0] if devices else "")
+        tk.OptionMenu(root,self.dev_var,*devices).pack()
+        self.log(f"✅ {len(devices)} mic(s) found")
+        self.stream=self.recognizer=self.processor=self.synthesizer=None
+        root.protocol("WM_DELETE_WINDOW",self.on_close)
 
-        tk.Label(ctrl, text="Use OpenAI:").grid(row=0,column=2)
-        self.openai_var = tk.BooleanVar(value=False)
-        tk.Checkbutton(ctrl, variable=self.openai_var).grid(row=0,column=3)
-
-        tk.Label(ctrl, text="TTS Model:").grid(row=1,column=0)
-        tm = ["tts_models/en/ljspeech/tacotron2-DDC","tts_models/en/ljspeech/glow-tts"]
-        self.tts_var = tk.StringVar(value=tm[0])
-        tk.OptionMenu(ctrl, self.tts_var, *tm).grid(row=1,column=1)
-
-        # start/stop
-        btnf = tk.Frame(root); btnf.pack(pady=5)
-        self.start_btn = tk.Button(btnf, text="Start", command=self.start_live)
-        self.start_btn.pack(side=tk.LEFT, padx=5)
-        self.stop_btn = tk.Button(btnf, text="Stop", command=self.stop_live, state=tk.DISABLED)
-        self.stop_btn.pack(side=tk.LEFT, padx=5)
-
-        # ask UI
-        self.ask_entry = tk.Entry(btnf, width=40, state=tk.DISABLED)
-        self.ask_entry.pack(side=tk.LEFT, padx=5)
-        self.ask_btn = tk.Button(btnf, text="Ask", command=self.ask_question, state=tk.DISABLED)
-        self.ask_btn.pack(side=tk.LEFT, padx=5)
-
-        # mic selection
-        tk.Label(root, text="Select Mic:").pack()
-        devices = [d['name'] for d in sd.query_devices() if d['max_input_channels']>0]
-        self.dev_var = tk.StringVar(value=devices[0] if devices else "")
-        tk.OptionMenu(root, self.dev_var, *devices).pack()
-        self.log("✅ {} mic(s) found".format(len(devices)))
-
-        self.stream = None
-        self.recognizer = None
-        self.processor = None
-        self.synthesizer = None
-
-        root.protocol("WM_DELETE_WINDOW", self.on_close)
-
-    def log(self, msg, tag=None):
+    def log(self,msg,tag=None):
         self.text_area.config(state=tk.NORMAL)
-        if tag:
-            self.text_area.insert(tk.END, msg+"\n", tag)
-        else:
-            self.text_area.insert(tk.END, msg+"\n")
+        if tag: self.text_area.insert(tk.END,msg+"\n",tag)
+        else: self.text_area.insert(tk.END,msg+"\n")
         self.text_area.config(state=tk.DISABLED)
         self.text_area.yview(tk.END)
-        self.root.update_idletasks()
         logging.info(msg)
 
     def start_live(self):
+        # Stop any ongoing speech
+        if self.synthesizer:
+            self.synthesizer.stop_all()
+        # UI state
         self.start_btn.config(state=tk.DISABLED)
         self.stop_btn.config(state=tk.NORMAL)
         self.ask_entry.config(state=tk.DISABLED)
         self.ask_btn.config(state=tk.DISABLED)
-
-        self.recognizer = SpeechRecognizer(self.whisper_var.get(), self.openai_var.get())
-        self.processor = LanguageProcessor()
-        self.synthesizer = SpeechSynthesizer(self.tts_var.get())
-
-        idx = [i for i,d in enumerate(sd.query_devices()) if d['name']==self.dev_var.get()][0]
-        self.stream = AsyncAudioStream(device=idx)
+        # init modules
+        self.recognizer=SpeechRecognizer(self.whisper_var.get(),self.openai_var.get())
+        self.processor=LanguageProcessor()
+        self.synthesizer=SpeechSynthesizer(self.tts_var.get())
+        idx=[i for i,d in enumerate(sd.query_devices()) if d['name']==self.dev_var.get()][0]
+        self.stream=AsyncAudioStream(device=idx)
         self.stream.start()
         self.log("🎤 Recording…")
 
     def stop_live(self):
         self.stream.stop()
         self.log("🛑 Stopped recording; processing…")
-        audio = self.stream.get_full_recording()
-        if audio.size == 0:
+        audio=self.stream.get_full_recording()
+        if audio.size==0:
             self.log("⚠️ No audio captured.")
         else:
-            chunks = asyncio.run(self.recognizer.transcribe(audio))
+            chunks=asyncio.run(self.recognizer.transcribe(audio))
             for txt in chunks:
-                # Display user text only
-                self.log(f"User: {txt}", tag="user")
-
-                # Generate bot reply and speak only bot text
-                reply = self.processor.generate_reply(txt)
-                self.log(f"Bot: {reply}", tag="bot")
-                threading.Thread(target=lambda r=reply: self.synthesizer.speak(r), daemon=True).start()
-
+                self.log(f"User: {txt}",tag="user")
+                reply=self.processor.generate_reply(txt)
+                self.log(f"Bot: {reply}",tag="bot")
+                threading.Thread(target=lambda r=reply,a=self.audio_var.get(): self.synthesizer.speak(r,a),daemon=True).start()
         self.start_btn.config(state=tk.NORMAL)
         self.stop_btn.config(state=tk.DISABLED)
         self.ask_entry.config(state=tk.NORMAL)
         self.ask_btn.config(state=tk.NORMAL)
 
     def ask_question(self):
-        q = self.ask_entry.get().strip()
-        if not q:
-            return
-        # Display user question only
-        self.log(f"User: {q}", tag="user")
-
+        q=self.ask_entry.get().strip()
+        if not q: return
+        self.log(f"User: {q}",tag="user")
         def worker():
-            reply = self.processor.generate_reply(q)
-            self.root.after(0, lambda: self.log(f"Bot: {reply}", tag="bot"))
-            threading.Thread(target=lambda r=reply: self.synthesizer.speak(r), daemon=True).start()
-        threading.Thread(target=worker, daemon=True).start()
-        self.ask_entry.delete(0, tk.END)
+            reply=self.processor.generate_reply(q)
+            self.root.after(0,lambda: self.log(f"Bot: {reply}",tag="bot"))
+            threading.Thread(target=lambda r=reply,a=self.audio_var.get(): self.synthesizer.speak(r,a),daemon=True).start()
+        threading.Thread(target=worker,daemon=True).start()
+        self.ask_entry.delete(0,tk.END)
 
     def on_close(self):
-        if self.stream:
-            self.stream.stop()
+        if self.stream: self.stream.stop()
+        if self.synthesizer: self.synthesizer.stop_all()
         self.root.destroy()
 
 class LiveTalkAIEntryPoint:
     def run(self):
-        root = tk.Tk()
+        root=tk.Tk()
         LiveTalkAIGUI(root)
         root.mainloop()
 
-if __name__ == '__main__':
+if __name__=='__main__':
     LiveTalkAIEntryPoint().run()
